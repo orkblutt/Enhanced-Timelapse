@@ -1,0 +1,14 @@
+# Core dependencies
+tensorflow>=2.8.0
+tensorflow-hub>=0.12.0
+opencv-python>=4.5.0
+numpy>=1.21.0
+tqdm>=4.64.0
+
+# Optional dependencies for better performance
+# tensorflow-gpu>=2.8.0  # Uncomment for GPU support
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0
