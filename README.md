@@ -284,7 +284,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- Google Research for the FILM model
+- Google Research for the FILM model (https://github.com/google-research/frame-interpolation?tab=readme-ov-file)
 - TensorFlow Hub team for model hosting
 - OpenCV community for image processing tools
 
