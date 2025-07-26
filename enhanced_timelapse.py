@@ -108,6 +108,11 @@ class TimelapseConfig:
     preview_mode: bool = False
     preview_frames: int = 100
     
+    # Model caching settings
+    model_cache_dir: str = None  # Will default to ~/.cache/tfhub
+    force_model_download: bool = False
+    clear_model_cache: bool = False
+    
     # File filters
     supported_formats: List[str] = None
     
@@ -138,11 +143,58 @@ class TimelapseConfig:
 class Interpolator:
     """TensorFlow Hub FILM interpolator with caching."""
     
-    def __init__(self, align: int = 64) -> None:
+    def __init__(self, config: TimelapseConfig = None, align: int = 64) -> None:
+        self._align = align
+        self._setup_model_cache(config)
         logger.info("Loading FILM model from TensorFlow Hub...")
         self._model = hub.load("https://tfhub.dev/google/film/1")
-        self._align = align
         logger.info("FILM model loaded successfully")
+    
+    def _setup_model_cache(self, config: TimelapseConfig) -> None:
+        """Setup TensorFlow Hub model caching."""
+        import shutil
+        
+        # Determine cache directory
+        if config and config.model_cache_dir:
+            cache_dir = Path(config.model_cache_dir).expanduser().resolve()
+        else:
+            # Default to user cache directory
+            cache_dir = Path.home() / ".cache" / "tfhub"
+        
+        # Create cache directory if it doesn't exist
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clear cache if requested
+        if config and config.clear_model_cache and cache_dir.exists():
+            logger.info(f"Clearing model cache at {cache_dir}")
+            try:
+                shutil.rmtree(cache_dir)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("Model cache cleared successfully")
+            except Exception as e:
+                logger.warning(f"Failed to clear cache: {e}")
+        
+        # Set TensorFlow Hub cache directory
+        os.environ['TFHUB_CACHE_DIR'] = str(cache_dir)
+        
+        # Check if model is already cached
+        model_cache_path = cache_dir / "google_film_1"
+        if model_cache_path.exists() and not (config and config.force_model_download):
+            logger.info(f"Using cached FILM model from {cache_dir}")
+        else:
+            if config and config.force_model_download:
+                logger.info("Force download enabled - will re-download model")
+            else:
+                logger.info(f"Model will be cached to {cache_dir} after first download")
+        
+        # Log cache information
+        try:
+            if cache_dir.exists():
+                cache_size = sum(f.stat().st_size for f in cache_dir.rglob('*') if f.is_file())
+                cache_size_mb = cache_size / (1024 * 1024)
+                logger.info(f"Cache directory: {cache_dir} ({cache_size_mb:.1f} MB)")
+        except Exception as e:
+            logger.debug(f"Could not calculate cache size: {e}")
 
     def __call__(self, x0: np.ndarray, x1: np.ndarray, dt: np.ndarray) -> np.ndarray:
         # Ensure inputs are float32
@@ -556,7 +608,7 @@ class TimelapseGenerator:
         # Process transitions
         if self.config.enable_interpolation:
             logger.info("Initializing interpolator...")
-            self.interpolator = Interpolator()
+            self.interpolator = Interpolator(self.config)
             
             logger.info("Processing image transitions with interpolation...")
             for idx in tqdm(range(len(self.images) - 1), desc="Processing transitions"):
@@ -653,6 +705,8 @@ Examples:
   python enhanced_timelapse.py images/ --config my.json  # Use config file
   python enhanced_timelapse.py --create-config           # Create sample config
   python enhanced_timelapse.py images/ --preview         # Preview mode
+  python enhanced_timelapse.py images/ --clear-cache     # Clear model cache first
+  python enhanced_timelapse.py images/ --force-download  # Force re-download model
         """
     )
     
@@ -681,6 +735,11 @@ Examples:
     parser.add_argument('--align', action='store_true', help="Enable image alignment")
     parser.add_argument('--alignment-method', choices=['ecc', 'orb'], default='ecc', help="Alignment method")
     parser.add_argument('--alignment-reference', choices=['first', 'most_zoomed', 'middle'], default='first', help="Reference image selection for alignment")
+    
+    # Model caching
+    parser.add_argument('--model-cache-dir', help="Custom model cache directory")
+    parser.add_argument('--force-download', action='store_true', help="Force re-download model even if cached")
+    parser.add_argument('--clear-cache', action='store_true', help="Clear model cache before running")
     
     # Preview and debug
     parser.add_argument('--preview', action='store_true', help="Preview mode (limited frames)")
@@ -726,6 +785,12 @@ Examples:
     config.alignment_reference_mode = args.alignment_reference
     config.preview_mode = args.preview
     config.preview_frames = args.preview_frames
+    
+    # Model caching settings
+    if args.model_cache_dir:
+        config.model_cache_dir = args.model_cache_dir
+    config.force_model_download = args.force_download
+    config.clear_model_cache = args.clear_cache
     
     # Log configuration
     logger.info("Configuration:")
