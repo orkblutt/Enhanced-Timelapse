@@ -31,15 +31,16 @@ A sophisticated timelapse generator with AI-powered frame interpolation using Te
 
 ### Requirements
 - Python 3.8+
-- TensorFlow 2.x
-- OpenCV
-- NumPy
-- tqdm
+- TensorFlow >=2.8.0
+- TensorFlow Hub >=0.12.0
+- OpenCV (headless) >=4.5.0
+- NumPy >=1.21.0
+- tqdm >=4.64.0
 
 ### Install Dependencies
 
 ```bash
-pip install tensorflow tensorflow-hub opencv-python numpy tqdm
+pip install tensorflow>=2.8.0 tensorflow-hub>=0.12.0 opencv-python-headless>=4.5.0 numpy>=1.21.0 tqdm>=4.64.0
 ```
 
 Or using the provided requirements file:
@@ -244,6 +245,10 @@ scripts/               # Utility scripts
 ```
 
 ## Examples
+
+### 🎥 Real-World Example: Landscape Timelapse
+Check out this landscape timelapse created with Enhanced Timelapse Generator:
+**[Landscape Timelapse Example](https://youtu.be/LMSnMowcAXg)** - Demonstrates the AI-powered frame interpolation and alignment features in action.
 
 ### Nature Timelapse
 ```bash
