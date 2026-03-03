@@ -17,24 +17,15 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict
+from dataclasses import asdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import subprocess
 
 # Add parent directory to path to import enhanced_timelapse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from enhanced_timelapse import TimelapseConfig, TimelapseGenerator
+from enhanced_timelapse import TimelapseConfig, TimelapseGenerator, _setup_logging
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('batch_process.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
 logger = logging.getLogger(__name__)
 
 def process_folder(folder_path: str, config: TimelapseConfig, output_dir: str) -> Dict:
@@ -50,7 +41,7 @@ def process_folder(folder_path: str, config: TimelapseConfig, output_dir: str) -
     
     try:
         # Create folder-specific config
-        folder_config = TimelapseConfig(**config.__dict__)
+        folder_config = TimelapseConfig(**asdict(config))
         folder_config.input_folder = folder_path
         
         # Generate output filename
@@ -126,6 +117,8 @@ def create_summary_report(results: List[Dict], output_dir: str):
     logger.info(f"Summary report saved to: {report_file}")
 
 def main():
+    _setup_logging(log_file='batch_process.log')
+
     parser = argparse.ArgumentParser(
         description="Batch process multiple folders for timelapse generation",
         formatter_class=argparse.RawDescriptionHelpFormatter,

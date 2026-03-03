@@ -26,9 +26,8 @@ import argparse
 import signal
 import logging
 from pathlib import Path
-from typing import Dict, Generator, List, Tuple, Optional
+from typing import Dict, Generator, List, Tuple
 from dataclasses import dataclass, asdict
-from datetime import datetime
 
 import numpy as np
 import tensorflow as tf
@@ -36,37 +35,55 @@ import tensorflow_hub as hub
 import cv2
 from tqdm import tqdm
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('timelapse.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
 logger = logging.getLogger(__name__)
 
-# Handle Ctrl+C gracefully
-def signal_handler(sig, frame):
-    logger.info("Interrupted! Exiting gracefully...")
-    sys.exit(0)
+_logging_initialized = False
+_tf_initialized = False
 
-signal.signal(signal.SIGINT, signal_handler)
 
-# Environment tweaks for stability and reduced logs
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+def _setup_logging(log_file: str = 'timelapse.log', verbose: bool = False):
+    """Configure logging handlers. Called once on first use."""
+    global _logging_initialized
+    if _logging_initialized:
+        return
+    _logging_initialized = True
 
-# Configure GPU memory growth
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        logger.info(f"Configured {len(gpus)} GPU(s) for memory growth")
-    except RuntimeError as e:
-        logger.error(f"GPU configuration error: {e}")
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+    # Handle Ctrl+C gracefully
+    def signal_handler(sig, frame):
+        logger.info("Interrupted! Exiting gracefully...")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+
+def _setup_tensorflow():
+    """Configure TensorFlow environment. Called once on first use."""
+    global _tf_initialized
+    if _tf_initialized:
+        return
+    _tf_initialized = True
+
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logger.info(f"Configured {len(gpus)} GPU(s) for memory growth")
+        except RuntimeError as e:
+            logger.error(f"GPU configuration error: {e}")
 
 @dataclass
 class TimelapseConfig:
@@ -81,30 +98,26 @@ class TimelapseConfig:
     width: int = 1920
     height: int = 1080
     codec: str = "mp4v"
-    quality: int = 95
-    
+
     # Timing settings (in frames)
     fade_in_frames: int = 30
     fade_out_frames: int = 30
     hold_frames: int = 30
-    
+
     # Interpolation settings
     interpolation_recursions: int = 4  # 2^4-1 = 15 intermediate frames
     enable_interpolation: bool = True
-    
+
     # Alignment settings
     enable_alignment: bool = False
     alignment_method: str = "ecc"  # "ecc" or "orb"
     alignment_reference_mode: str = "first"  # "first", "most_zoomed", "middle"
     alignment_scale: float = 0.25
-    
+
     # Effects settings
     enable_fade_effects: bool = True
-    enable_stabilization: bool = False
-    crop_to_stable: bool = False
-    
+
     # Processing settings
-    batch_size: int = 1
     preview_mode: bool = False
     preview_frames: int = 100
     
@@ -240,10 +253,19 @@ class Interpolator:
         
         return padded_x, bbox_to_crop
 
+def _limit_generator(gen, max_items):
+    """Limit a generator to max_items yields."""
+    for i, item in enumerate(gen):
+        if i >= max_items:
+            break
+        yield item
+
+
 class TimelapseGenerator:
     """Main timelapse generator class."""
     
     def __init__(self, config: TimelapseConfig):
+        _setup_tensorflow()
         self.config = config
         self.interpolator = None
         self.image_files = []
@@ -357,73 +379,60 @@ class TimelapseGenerator:
         """Find most zoomed image using homography scale analysis."""
         if len(images) <= 1:
             return 0
-        
+
         logger.info("Using homography analysis to find optimal reference...")
-        
-        # Initialize feature detector
+
         orb = cv2.ORB_create(nfeatures=1000)
-        
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+        # Precompute features for all images
+        features = []
+        for img in tqdm(images, desc="Extracting features"):
+            gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+            kp, des = orb.detectAndCompute(gray, None)
+            features.append((kp, des))
+
         # Calculate relative scales between image pairs
         scale_scores = []
-        
-        for i, img in enumerate(images):
-            try:
-                gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-                kp, des = orb.detectAndCompute(gray, None)
-                
-                if des is None:
-                    scale_scores.append(0.0)
-                    continue
-                
-                # Compare with other images to find relative scale
-                relative_scales = []
-                
-                for j, other_img in enumerate(images):
-                    if i == j:
-                        continue
-                    
-                    other_gray = cv2.cvtColor((other_img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-                    other_kp, other_des = orb.detectAndCompute(other_gray, None)
-                    
-                    if other_des is None:
-                        continue
-                    
-                    # Match features
-                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-                    matches = bf.match(des, other_des)
-                    
-                    if len(matches) < 10:
-                        continue
-                    
-                    # Calculate homography and extract scale
-                    src_pts = np.float32([kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-                    dst_pts = np.float32([other_kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-                    
-                    try:
-                        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                        if M is not None:
-                            # Extract scale from homography matrix
-                            scale_x = np.sqrt(M[0, 0]**2 + M[0, 1]**2)
-                            scale_y = np.sqrt(M[1, 0]**2 + M[1, 1]**2)
-                            avg_scale = (scale_x + scale_y) / 2
-                            relative_scales.append(avg_scale)
-                    except:
-                        continue
-                
-                # Image with consistently smaller scale relative to others = more zoomed
-                if relative_scales:
-                    avg_relative_scale = np.mean(relative_scales)
-                    scale_scores.append(1.0 / (avg_relative_scale + 0.1))  # Inverse scale
-                else:
-                    scale_scores.append(0.0)
-                    
-            except Exception as e:
-                logger.warning(f"Error in homography analysis for image {i}: {e}")
+
+        for i, (kp_i, des_i) in enumerate(features):
+            if des_i is None:
                 scale_scores.append(0.0)
-        
+                continue
+
+            relative_scales = []
+
+            for j, (kp_j, des_j) in enumerate(features):
+                if i == j or des_j is None:
+                    continue
+
+                matches = bf.match(des_i, des_j)
+
+                if len(matches) < 10:
+                    continue
+
+                src_pts = np.float32([kp_i[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kp_j[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+                try:
+                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                    if M is not None:
+                        scale_x = np.sqrt(M[0, 0]**2 + M[0, 1]**2)
+                        scale_y = np.sqrt(M[1, 0]**2 + M[1, 1]**2)
+                        avg_scale = (scale_x + scale_y) / 2
+                        relative_scales.append(avg_scale)
+                except Exception:
+                    continue
+
+            if relative_scales:
+                avg_relative_scale = np.mean(relative_scales)
+                scale_scores.append(1.0 / (avg_relative_scale + 0.1))
+            else:
+                scale_scores.append(0.0)
+
         most_zoomed_idx = np.argmax(scale_scores)
         logger.info(f"Homography analysis: most zoomed image at index {most_zoomed_idx}")
-        
+
         return most_zoomed_idx
     
     def select_reference_image(self, images: List[np.ndarray]) -> int:
@@ -534,158 +543,154 @@ class TimelapseGenerator:
             logger.warning(f"ORB alignment failed: {e}")
             return image
     
-    def recursive_generator(self, frame1: np.ndarray, frame2: np.ndarray, 
+    def recursive_generator(self, frame1: np.ndarray, frame2: np.ndarray,
                           num_recursions: int, interpolator: Interpolator) -> Generator[np.ndarray, None, None]:
-        """Recursive generator for midpoint interpolation."""
+        """Recursive generator for midpoint interpolation.
+
+        Yields all frames from frame1 up to (but not including) frame2.
+        The caller is responsible for adding the final frame.
+        """
         if num_recursions == 0:
             yield frame1
         else:
             dt = np.full(shape=(1,), fill_value=0.5, dtype=np.float32)
             mid_frame = interpolator(
-                np.expand_dims(frame1, axis=0), 
-                np.expand_dims(frame2, axis=0), 
+                np.expand_dims(frame1, axis=0),
+                np.expand_dims(frame2, axis=0),
                 dt
             )[0]
             yield from self.recursive_generator(frame1, mid_frame, num_recursions - 1, interpolator)
             yield from self.recursive_generator(mid_frame, frame2, num_recursions - 1, interpolator)
-        yield frame2
     
-    def generate_timelapse(self):
-        """Generate the timelapse video."""
-        logger.info("Starting timelapse generation...")
-        
-        # Load images
-        self.load_images()
-        
-        # Load and resize images
-        logger.info("Loading and resizing images...")
-        raw_images = []
-        for file_path in tqdm(self.image_files, desc="Loading images"):
-            raw_images.append(self.load_and_resize_image(file_path))
-        
-        # Align images if enabled
-        if self.config.enable_alignment:
-            logger.info(f"Aligning images using {self.config.alignment_method} method...")
-            logger.info(f"Reference selection mode: {self.config.alignment_reference_mode}")
-            
-            # Select reference image
-            reference_idx = self.select_reference_image(raw_images)
-            reference = raw_images[reference_idx]
-            
-            logger.info(f"Using image {reference_idx} as alignment reference")
-            
-            # Align all images to the reference
-            self.images = []
-            for i, img in enumerate(tqdm(raw_images, desc="Aligning images")):
-                if i == reference_idx:
-                    # Reference image doesn't need alignment
-                    self.images.append(img)
-                else:
-                    aligned = self.align_image_to_reference(img, reference)
-                    self.images.append(aligned)
-        else:
-            self.images = raw_images
-            logger.info("Skipping image alignment")
-        
-        # Generate frames
-        all_frames = []
+    def _generate_frames(self) -> Generator[np.ndarray, None, None]:
+        """Generate all timelapse frames as a stream, avoiding bulk memory usage."""
         black = np.zeros((self.config.height, self.config.width, 3), dtype=np.float32)
-        
+
         # Fade in
         if self.config.enable_fade_effects and self.config.fade_in_frames > 0:
             logger.info("Generating fade-in effect...")
             for i in range(self.config.fade_in_frames):
-                alpha = i / (self.config.fade_in_frames - 1)
-                frame = black * (1 - alpha) + self.images[0] * alpha
-                all_frames.append(frame)
-        
+                alpha = i / max(self.config.fade_in_frames - 1, 1)
+                yield black * (1 - alpha) + self.images[0] * alpha
+
         # Hold first image
         if self.config.hold_frames > 0:
-            logger.info(f"Adding {self.config.hold_frames} hold frames for first image...")
             for _ in range(self.config.hold_frames):
-                all_frames.append(self.images[0])
-        
+                yield self.images[0]
+
         # Process transitions
         if self.config.enable_interpolation:
-            logger.info("Initializing interpolator...")
-            self.interpolator = Interpolator(self.config)
-            
-            logger.info("Processing image transitions with interpolation...")
-            for idx in tqdm(range(len(self.images) - 1), desc="Processing transitions"):
+            for idx in range(len(self.images) - 1):
                 img1 = self.images[idx]
                 img2 = self.images[idx + 1]
-                
-                # Generate interpolated frames
+
                 gen = self.recursive_generator(
                     img1, img2, self.config.interpolation_recursions, self.interpolator
                 )
-                transition_frames = list(gen)
-                
-                # Add intermediate frames (exclude start/end)
-                intermediates = transition_frames[1:-1]
-                all_frames.extend(intermediates)
-                
+                # Skip first frame (img1, already held/added)
+                first = True
+                for frame in gen:
+                    if first:
+                        first = False
+                        continue
+                    yield frame
+
                 # Hold next image
-                if self.config.hold_frames > 0:
-                    for _ in range(self.config.hold_frames):
-                        all_frames.append(img2)
+                for _ in range(self.config.hold_frames):
+                    yield img2
         else:
-            logger.info("Processing without interpolation...")
             for idx in range(1, len(self.images)):
-                # Add image directly
-                if self.config.hold_frames > 0:
-                    for _ in range(self.config.hold_frames):
-                        all_frames.append(self.images[idx])
-        
+                for _ in range(max(self.config.hold_frames, 1)):
+                    yield self.images[idx]
+
         # Fade out
         if self.config.enable_fade_effects and self.config.fade_out_frames > 0:
             logger.info("Generating fade-out effect...")
             last_img = self.images[-1]
             for i in range(self.config.fade_out_frames):
-                alpha = 1 - (i / (self.config.fade_out_frames - 1))
-                frame = last_img * alpha + black * (1 - alpha)
-                all_frames.append(frame)
-        
-        # Preview mode
+                alpha = 1 - (i / max(self.config.fade_out_frames - 1, 1))
+                yield last_img * alpha + black * (1 - alpha)
+
+    def generate_timelapse(self):
+        """Generate the timelapse video."""
+        logger.info("Starting timelapse generation...")
+
+        # Load images
+        self.load_images()
+
+        # Load and resize images
+        logger.info("Loading and resizing images...")
+        raw_images = []
+        for file_path in tqdm(self.image_files, desc="Loading images"):
+            raw_images.append(self.load_and_resize_image(file_path))
+
+        # Align images if enabled
+        if self.config.enable_alignment:
+            logger.info(f"Aligning images using {self.config.alignment_method} method...")
+            logger.info(f"Reference selection mode: {self.config.alignment_reference_mode}")
+
+            reference_idx = self.select_reference_image(raw_images)
+            reference = raw_images[reference_idx]
+            logger.info(f"Using image {reference_idx} as alignment reference")
+
+            self.images = []
+            for i, img in enumerate(tqdm(raw_images, desc="Aligning images")):
+                if i == reference_idx:
+                    self.images.append(img)
+                else:
+                    self.images.append(self.align_image_to_reference(img, reference))
+        else:
+            self.images = raw_images
+            logger.info("Skipping image alignment")
+
+        # Initialize interpolator if needed
+        if self.config.enable_interpolation:
+            logger.info("Initializing interpolator...")
+            self.interpolator = Interpolator(self.config)
+
+        # Stream frames to video
+        frame_gen = self._generate_frames()
+
+        # Apply preview limit
         if self.config.preview_mode:
-            total_frames = min(len(all_frames), self.config.preview_frames)
-            all_frames = all_frames[:total_frames]
-            logger.info(f"Preview mode: using first {total_frames} frames")
-        
-        # Write video
-        logger.info(f"Writing {len(all_frames)} frames to video...")
-        self._write_video(all_frames)
-        
+            frame_gen = _limit_generator(frame_gen, self.config.preview_frames)
+            logger.info(f"Preview mode: limiting to {self.config.preview_frames} frames")
+
+        logger.info("Writing frames to video...")
+        frame_count = self._write_video(frame_gen)
+
         logger.info(f"Timelapse generation completed! Output: {self.config.output_file}")
-        logger.info(f"Total frames: {len(all_frames)}")
-        logger.info(f"Duration: {len(all_frames) / self.config.fps:.2f} seconds")
-    
-    def _write_video(self, frames: List[np.ndarray]):
-        """Write frames to video file."""
-        # Get codec
+        logger.info(f"Total frames: {frame_count}")
+        logger.info(f"Duration: {frame_count / self.config.fps:.2f} seconds")
+
+    def _write_video(self, frames) -> int:
+        """Write frames to video file. Returns frame count."""
         if self.config.codec == 'h264':
             fourcc = cv2.VideoWriter_fourcc(*'H264')
         elif self.config.codec == 'xvid':
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
         else:
             fourcc = cv2.VideoWriter_fourcc(*self.config.codec)
-        
-        # Create video writer
+
         video_writer = cv2.VideoWriter(
             self.config.output_file, fourcc, self.config.fps,
             (self.config.width, self.config.height)
         )
-        
+
         if not video_writer.isOpened():
             raise RuntimeError(f"Could not open video writer for {self.config.output_file}")
-        
-        # Write frames
-        for frame in tqdm(frames, desc="Writing video"):
-            frame_uint8 = (frame * 255).astype(np.uint8)
-            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
-            video_writer.write(frame_bgr)
-        
-        video_writer.release()
+
+        frame_count = 0
+        try:
+            for frame in frames:
+                frame_uint8 = (frame * 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
+                video_writer.write(frame_bgr)
+                frame_count += 1
+        finally:
+            video_writer.release()
+
+        return frame_count
 
 def create_sample_config():
     """Create a sample configuration file."""
@@ -716,42 +721,42 @@ Examples:
     parser.add_argument('--create-config', action='store_true', help="Create sample config file")
     
     # Video settings
-    parser.add_argument('--fps', type=int, default=30, help="Output frame rate")
-    parser.add_argument('--width', type=int, default=1920, help="Output width")
-    parser.add_argument('--height', type=int, default=1080, help="Output height")
-    parser.add_argument('--codec', default='mp4v', help="Video codec")
-    
+    parser.add_argument('--fps', type=int, default=None, help="Output frame rate (default: 30)")
+    parser.add_argument('--width', type=int, default=None, help="Output width (default: 1920)")
+    parser.add_argument('--height', type=int, default=None, help="Output height (default: 1080)")
+    parser.add_argument('--codec', default=None, help="Video codec (default: mp4v)")
+
     # Timing settings
-    parser.add_argument('--fade-in', type=int, default=30, help="Fade-in duration (frames)")
-    parser.add_argument('--fade-out', type=int, default=30, help="Fade-out duration (frames)")
-    parser.add_argument('--hold', type=int, default=30, help="Hold duration per image (frames)")
-    
+    parser.add_argument('--fade-in', type=int, default=None, help="Fade-in duration in frames (default: 30)")
+    parser.add_argument('--fade-out', type=int, default=None, help="Fade-out duration in frames (default: 30)")
+    parser.add_argument('--hold', type=int, default=None, help="Hold duration per image in frames (default: 30)")
+
     # Effects
     parser.add_argument('--no-fade', action='store_true', help="Disable fade effects")
     parser.add_argument('--no-interpolation', action='store_true', help="Disable frame interpolation")
-    parser.add_argument('--interpolation-level', type=int, default=4, help="Interpolation recursion level")
-    
+    parser.add_argument('--interpolation-level', type=int, default=None, help="Interpolation recursion level (default: 4)")
+
     # Alignment
     parser.add_argument('--align', action='store_true', help="Enable image alignment")
-    parser.add_argument('--alignment-method', choices=['ecc', 'orb'], default='ecc', help="Alignment method")
-    parser.add_argument('--alignment-reference', choices=['first', 'most_zoomed', 'middle'], default='first', help="Reference image selection for alignment")
-    
+    parser.add_argument('--alignment-method', choices=['ecc', 'orb'], default=None, help="Alignment method (default: ecc)")
+    parser.add_argument('--alignment-reference', choices=['first', 'most_zoomed', 'middle'], default=None, help="Reference image selection for alignment (default: first)")
+
     # Model caching
     parser.add_argument('--model-cache-dir', help="Custom model cache directory")
     parser.add_argument('--force-download', action='store_true', help="Force re-download model even if cached")
     parser.add_argument('--clear-cache', action='store_true', help="Clear model cache before running")
-    
+
+
     # Preview and debug
     parser.add_argument('--preview', action='store_true', help="Preview mode (limited frames)")
-    parser.add_argument('--preview-frames', type=int, default=100, help="Number of preview frames")
+    parser.add_argument('--preview-frames', type=int, default=None, help="Number of preview frames (default: 100)")
     parser.add_argument('--verbose', '-v', action='store_true', help="Verbose logging")
     
     args = parser.parse_args()
-    
-    # Set logging level
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
+
+    # Initialize logging
+    _setup_logging(verbose=args.verbose)
+
     # Create sample config
     if args.create_config:
         create_sample_config()
@@ -767,24 +772,40 @@ Examples:
     else:
         config = TimelapseConfig()
     
-    # Override config with command line arguments
+    # Override config with explicitly provided command line arguments
     config.input_folder = args.input_folder
-    config.output_file = args.output
-    config.fps = args.fps
-    config.width = args.width
-    config.height = args.height
-    config.codec = args.codec
-    config.fade_in_frames = args.fade_in
-    config.fade_out_frames = args.fade_out
-    config.hold_frames = args.hold
-    config.enable_fade_effects = not args.no_fade
-    config.enable_interpolation = not args.no_interpolation
-    config.interpolation_recursions = args.interpolation_level
-    config.enable_alignment = args.align
-    config.alignment_method = args.alignment_method
-    config.alignment_reference_mode = args.alignment_reference
-    config.preview_mode = args.preview
-    config.preview_frames = args.preview_frames
+    if args.output:
+        config.output_file = args.output
+    if args.fps is not None:
+        config.fps = args.fps
+    if args.width is not None:
+        config.width = args.width
+    if args.height is not None:
+        config.height = args.height
+    if args.codec is not None:
+        config.codec = args.codec
+    if args.fade_in is not None:
+        config.fade_in_frames = args.fade_in
+    if args.fade_out is not None:
+        config.fade_out_frames = args.fade_out
+    if args.hold is not None:
+        config.hold_frames = args.hold
+    if args.no_fade:
+        config.enable_fade_effects = False
+    if args.no_interpolation:
+        config.enable_interpolation = False
+    if args.interpolation_level is not None:
+        config.interpolation_recursions = args.interpolation_level
+    if args.align:
+        config.enable_alignment = True
+    if args.alignment_method is not None:
+        config.alignment_method = args.alignment_method
+    if args.alignment_reference is not None:
+        config.alignment_reference_mode = args.alignment_reference
+    if args.preview:
+        config.preview_mode = True
+    if args.preview_frames is not None:
+        config.preview_frames = args.preview_frames
     
     # Model caching settings
     if args.model_cache_dir:

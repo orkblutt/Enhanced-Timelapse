@@ -5,7 +5,6 @@
   "width": 3840,
   "height": 2160,
   "codec": "h264",
-  "quality": 95,
   "fade_in_frames": 90,
   "fade_out_frames": 90,
   "hold_frames": 20,
@@ -16,9 +15,6 @@
   "alignment_reference_mode": "most_zoomed",
   "alignment_scale": 0.25,
   "enable_fade_effects": true,
-  "enable_stabilization": false,
-  "crop_to_stable": false,
-  "batch_size": 1,
   "preview_mode": false,
   "preview_frames": 100,
   "supported_formats": [".jpg", ".jpeg", ".png", ".bmp", ".tiff"]
