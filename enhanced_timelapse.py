@@ -22,9 +22,11 @@ License: MIT
 import os
 import sys
 import json
+import shutil
 import argparse
 import signal
 import logging
+import subprocess
 from pathlib import Path
 from typing import Dict, Generator, List, Tuple
 from dataclasses import dataclass, asdict
@@ -664,13 +666,61 @@ class TimelapseGenerator:
         logger.info(f"Duration: {frame_count / self.config.fps:.2f} seconds")
 
     def _write_video(self, frames) -> int:
-        """Write frames to video file. Returns frame count."""
-        if self.config.codec == 'h264':
-            fourcc = cv2.VideoWriter_fourcc(*'H264')
-        elif self.config.codec == 'xvid':
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        """Write frames to video file. Returns frame count.
+
+        Uses ffmpeg piped input for broad codec/container compatibility.
+        Falls back to OpenCV VideoWriter if ffmpeg is not available.
+        """
+        if shutil.which('ffmpeg'):
+            return self._write_video_ffmpeg(frames)
         else:
-            fourcc = cv2.VideoWriter_fourcc(*self.config.codec)
+            logger.warning("ffmpeg not found, falling back to OpenCV VideoWriter")
+            return self._write_video_opencv(frames)
+
+    def _write_video_ffmpeg(self, frames) -> int:
+        """Write frames via ffmpeg pipe for proper H.264 encoding."""
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{self.config.width}x{self.config.height}',
+            '-pix_fmt', 'bgr24',
+            '-r', str(self.config.fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '18',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            self.config.output_file
+        ]
+
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+
+        frame_count = 0
+        try:
+            for frame in frames:
+                frame_uint8 = (frame * 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
+                process.stdin.write(frame_bgr.tobytes())
+                frame_count += 1
+        finally:
+            process.stdin.close()
+            process.wait()
+            if process.returncode != 0:
+                stderr = process.stderr.read()
+                logger.error(f"ffmpeg error: {stderr.decode()}")
+                raise RuntimeError(f"ffmpeg exited with code {process.returncode}")
+            process.stderr.close()
+
+        return frame_count
+
+    def _write_video_opencv(self, frames) -> int:
+        """Fallback: write frames using OpenCV VideoWriter."""
+        fourcc = cv2.VideoWriter_fourcc(*self.config.codec)
 
         video_writer = cv2.VideoWriter(
             self.config.output_file, fourcc, self.config.fps,
